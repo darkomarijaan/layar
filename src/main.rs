@@ -2,6 +2,7 @@
 #![allow(deprecated)]
 mod opensub;
 mod skins;
+mod thumbs;
 mod update;
 mod video;
 
@@ -88,6 +89,8 @@ struct State {
     loaded: bool,
     ab_loop: bool,
     playlist: Vec<String>,
+    /// Full path or URL of each playlist entry, same order as `playlist`.
+    playlist_paths: Vec<String>,
     plpos: i64,
     audio: Vec<Track>,
     subs: Vec<Track>,
@@ -166,6 +169,11 @@ struct App {
     upd_rel: Option<update::Release>,
     upd_rx: Option<mpsc::Receiver<update::Msg>>,
     upd_progress: Arc<AtomicU64>,
+    // Lounge thumbnails, keyed by full path.
+    thumbs: std::collections::HashMap<String, skins::ThumbState>,
+    thumb_rx: Option<mpsc::Receiver<(String, Result<thumbs::Thumb, String>)>>,
+    /// Entries whose cards were on screen last frame, nearest first; the worker takes them in this order.
+    thumb_want: Vec<String>,
 }
 
 
@@ -235,6 +243,93 @@ fn trim_memory() {
             fn K32EmptyWorkingSet(process: isize) -> i32;
         }
         K32EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Span {
+    Plain,
+    Bold,
+    Code,
+}
+
+/// Split one line of Markdown into styled pieces. Handles `**bold**` and `` `code` ``; the markers are dropped.
+fn md_spans(line: &str) -> Vec<(String, Span)> {
+    fn flush(buf: &mut String, bold: bool, code: bool, out: &mut Vec<(String, Span)>) {
+        if !buf.is_empty() {
+            out.push((std::mem::take(buf), if code { Span::Code } else if bold { Span::Bold } else { Span::Plain }));
+        }
+    }
+    let (mut out, mut buf, mut bold, mut code) = (Vec::new(), String::new(), false, false);
+    let mut it = line.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '*' && it.peek() == Some(&'*') && !code {
+            it.next();
+            flush(&mut buf, bold, code, &mut out);
+            bold = !bold;
+        } else if c == '`' {
+            flush(&mut buf, bold, code, &mut out);
+            code = !code;
+        } else {
+            buf.push(c);
+        }
+    }
+    flush(&mut buf, bold, code, &mut out);
+    out
+}
+
+/// Show GitHub release notes without the raw Markdown marks: headings, bullets, bold and code.
+fn release_notes(ui: &mut egui::Ui, text: &str) {
+    // Some editors save a byte-order mark first; it is not whitespace, so drop it explicitly.
+    for raw in text.trim_start_matches('\u{feff}').lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            ui.add_space(4.0);
+            continue;
+        }
+        let hashes = line.chars().take_while(|c| *c == '#').count();
+        if hashes > 0 && line[hashes..].starts_with(' ') {
+            ui.add_space(2.0);
+            ui.label(RichText::new(line[hashes..].trim()).strong().size(if hashes <= 2 { 15.0 } else { 13.5 }));
+            continue;
+        }
+        let (bullet, body) = match line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+            Some(b) => (true, b),
+            None => (false, line),
+        };
+        let mut job = egui::text::LayoutJob::default();
+        for (txt, span) in md_spans(body) {
+            let (font_id, color) = match span {
+                Span::Plain => (egui::FontId::proportional(12.5), Color32::from_rgb(0xb4, 0xbc, 0xc6)),
+                Span::Bold => (egui::FontId::proportional(12.5), Color32::WHITE),
+                Span::Code => (egui::FontId::monospace(12.0), ACCENT),
+            };
+            job.append(&txt, 0.0, egui::text::TextFormat { font_id, color, ..Default::default() });
+        }
+        if bullet {
+            ui.horizontal_top(|ui| {
+                ui.add_space(4.0);
+                ui.label(RichText::new("•").color(MUTED));
+                ui.add(egui::Label::new(job).wrap());
+            });
+        } else {
+            ui.add(egui::Label::new(job).wrap());
+        }
+    }
+}
+
+#[cfg(test)]
+mod md_tests {
+    use super::*;
+
+    #[test]
+    fn spans_drop_markers() {
+        assert_eq!(md_spans("**Cinema**: video"), vec![("Cinema".into(), Span::Bold), (": video".into(), Span::Plain)]);
+        assert_eq!(md_spans("keep `libmpv-2.dll` here"), vec![("keep ".into(), Span::Plain), ("libmpv-2.dll".into(), Span::Code), (" here".into(), Span::Plain)]);
+        assert_eq!(md_spans("plain"), vec![("plain".into(), Span::Plain)]);
+        assert!(md_spans("").is_empty());
+        // An unclosed marker must not swallow the text.
+        assert_eq!(md_spans("a **b"), vec![("a ".into(), Span::Plain), ("b".into(), Span::Bold)]);
     }
 }
 
@@ -354,6 +449,9 @@ impl App {
             upd_rel: None,
             upd_rx: None,
             upd_progress: Arc::new(AtomicU64::new(0)),
+            thumbs: Default::default(),
+            thumb_rx: None,
+            thumb_want: Vec::new(),
         };
         update::cleanup(); // remove the exe an earlier update left behind
         app.load_settings();
@@ -407,7 +505,8 @@ impl App {
         s.drops = v.i64("frame-drop-count");
         s.cache = v.f64("demuxer-cache-duration");
         s.plpos = v.i64("playlist-pos");
-        s.playlist = (0..v.i64("playlist-count")).map(|i| base_name(&v.str(&format!("playlist/{i}/filename")))).collect();
+        s.playlist_paths = (0..v.i64("playlist-count")).map(|i| v.str(&format!("playlist/{i}/filename"))).collect();
+        s.playlist = s.playlist_paths.iter().map(|p| base_name(p)).collect();
         let (w, h) = (v.i64("video-params/w"), v.i64("video-params/h"));
         s.video_info = if w > 0 {
             format!("{} · {}×{} · {:.3} fps", v.str("video-codec").split(' ').next().unwrap_or(""), w, h, v.f64("container-fps"))
@@ -1188,6 +1287,7 @@ impl eframe::App for App {
         self.refresh();
         self.os_poll();
         self.upd_poll(ctx);
+        self.thumb_poll(ctx);
         self.shortcuts(ctx);
 
         // Trim once things settle after a file opens, and every 20 s otherwise.
@@ -1451,9 +1551,7 @@ impl eframe::App for App {
                     ui.label(RichText::new(format!("You have {VERSION}.")).color(MUTED));
                     if !rel.notes.trim().is_empty() {
                         ui.add_space(6.0);
-                        egui::ScrollArea::vertical().max_height(170.0).show(ui, |ui| {
-                            ui.label(RichText::new(rel.notes.trim()).size(12.5));
-                        });
+                        egui::ScrollArea::vertical().max_height(170.0).show(ui, |ui| release_notes(ui, &rel.notes));
                     }
                     ui.add_space(8.0);
                     if installing {

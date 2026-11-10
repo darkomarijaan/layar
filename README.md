@@ -63,10 +63,12 @@ Pick one in **View > Skin** (or the menu popup in the skins that have no menu ba
 | **Cinema** | Black and glass, ice-blue accent | Video fills the window; controls float and fade out when the mouse rests. Playlist drawer and menu behind two round buttons |
 | **Deck** | Gunmetal with green LCD, like a hi-fi stack | One dense panel: bevelled screen, LCD clock and info, LCD playlist, pressable square keys, LED switches |
 | **Studio** | Light, sharp corners, blue accent | Icon rail on the left, drop-downs for subtitle and audio, chapter timeline, labelled buttons |
-| **Lounge** | Plum and pink, big and clear for the sofa | Poster-style screen with large title and pill buttons; playlist as a strip of cards |
+| **Lounge** | Plum and pink, big and clear for the sofa | Poster-style screen with large title and pill buttons; playlist as a strip of cards with video thumbnails |
 | **Terminal** | Amber on black, all monospace | Boxed text panes, block progress bar, keycap buttons, status line |
 
-Fullscreen always uses the Cinema overlay, whatever skin is chosen. Lounge cards show a colour and number per file, not a picture of the video.
+Fullscreen always uses the Cinema overlay, whatever skin is chosen.
+
+Lounge cards show a real frame from each video (taken at 12 % of the file, made by libmpv itself, so no extra software is needed). They are made in the background only for cards you can see, one at a time, and cached as small JPEGs in the `thumbs` folder inside the data folder, so a file is decoded once. Audio files with cover art use the cover; files that cannot give a picture keep a colour and a number. The `thumbs` folder is safe to delete.
 
 ## Updates
 
@@ -98,6 +100,7 @@ You need Rust (stable, 2024 edition) and the MSVC toolchain.
 | `src/main.rs` | interface, menus, settings, shortcuts |
 | `src/video.rs` | mpv setup, OpenGL rendering into egui, data folder |
 | `src/skins.rs` | the five extra skins: palettes, drawing helpers, one layout function each |
+| `src/thumbs.rs` | video thumbnails through a second, short-lived libmpv instance, with a disk cache |
 | `src/opensub.rs` | OpenSubtitles.com client (runs on a worker thread) |
 | `src/update.rs` | GitHub release check, verified download and exe swap |
 

@@ -379,7 +379,63 @@ fn text_btn(ui: &mut Ui, p: &Pal, label: &str, arrow: bool, filled: bool, size: 
     resp
 }
 
+pub enum ThumbState {
+    Pending,
+    Ready(egui::TextureHandle),
+    Failed,
+}
+
 impl App {
+    /// Collect a finished thumbnail, then start the next one the Lounge strip is showing.
+    /// One worker at a time keeps the CPU free for playback.
+    pub(crate) fn thumb_poll(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.thumb_rx {
+            match rx.try_recv() {
+                Ok((path, res)) => {
+                    self.thumb_rx = None;
+                    let state = match res {
+                        Ok(t) => {
+                            let img = egui::ColorImage::from_rgba_unmultiplied([t.w, t.h], &t.rgba);
+                            ThumbState::Ready(ctx.load_texture(format!("thumb:{path}"), img, egui::TextureOptions::LINEAR))
+                        }
+                        Err(_) => ThumbState::Failed, // audio-only, unreadable, or a URL: the card keeps its colour
+                    };
+                    self.thumbs.insert(path, state);
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.thumb_rx = None;
+                    for s in self.thumbs.values_mut() {
+                        if matches!(s, ThumbState::Pending) {
+                            *s = ThumbState::Failed;
+                        }
+                    }
+                }
+            }
+        }
+        if self.skin != Skin::Lounge {
+            return;
+        }
+        if self.thumbs.len() > 200 {
+            let keep = &self.thumb_want;
+            self.thumbs.retain(|k, s| matches!(s, ThumbState::Pending) || keep.contains(k));
+        }
+        let Some(path) = self.thumb_want.iter().find(|p| !self.thumbs.contains_key(*p)).cloned() else { return };
+        if thumbs::key(&path).is_none() {
+            self.thumbs.insert(path, ThumbState::Failed);
+            return;
+        }
+        self.thumbs.insert(path.clone(), ThumbState::Pending);
+        let dir = data_dir().join("thumbs");
+        let (tx, rx) = mpsc::channel();
+        self.thumb_rx = Some(rx);
+        std::thread::spawn(move || {
+            let r = thumbs::make(&path, &dir);
+            let _ = tx.send((path, r));
+        });
+    }
+
     fn frac(&self) -> f32 {
         if self.s.dur > 0.0 { (self.s.pos / self.s.dur).clamp(0.0, 1.0) as f32 } else { 0.0 }
     }
@@ -1013,6 +1069,7 @@ impl App {
             ui.label(RichText::new("UP NEXT").size(11.0).color(p.muted).strong());
             ui.add_space(6.0);
             let mut jump = None;
+            let mut wanted: Vec<String> = Vec::new();
             if self.s.playlist.is_empty() {
                 ui.label(RichText::new("Drop files here or press Ctrl+O").color(p.muted));
             }
@@ -1022,12 +1079,38 @@ impl App {
                     for (i, name) in self.s.playlist.iter().enumerate() {
                         let now = i as i64 == self.s.plpos;
                         let (rect, resp) = ui.allocate_exact_size(Vec2::new(196.0, 110.0), Sense::click());
+                        if !ui.is_rect_visible(rect) {
+                            continue; // scrolled out of view: neither drawn nor decoded
+                        }
+                        let path = self.s.playlist_paths.get(i);
+                        if let Some(pa) = path {
+                            wanted.push(pa.clone());
+                        }
+                        let thumb = path.and_then(|pa| match self.thumbs.get(pa) {
+                            Some(ThumbState::Ready(t)) => Some(t),
+                            _ => None,
+                        });
                         let hue = name_hue(name);
                         let pr = ui.painter();
                         pr.rect_filled(rect, 14.0, hsv(hue, 0.55, if resp.hovered() { 0.85 } else { 0.72 }));
-                        let low = Rect::from_min_max(Pos2::new(rect.left(), rect.top() + rect.height() * 0.55), rect.right_bottom());
-                        pr.rect_filled(low, egui::CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 }, Color32::from_black_alpha(95));
-                        pr.text(Pos2::new(rect.center().x, rect.top() + rect.height() * 0.34), Align2::CENTER_CENTER, (i + 1).to_string(), FontId::proportional(32.0), Color32::from_white_alpha(120));
+                        if let Some(t) = thumb {
+                            // Fill the card, cropping the picture instead of stretching it.
+                            let (ta, ca) = (t.size()[0] as f32 / t.size()[1].max(1) as f32, rect.width() / rect.height());
+                            let uv = if ta > ca {
+                                let w = ca / ta;
+                                Rect::from_min_max(Pos2::new((1.0 - w) / 2.0, 0.0), Pos2::new((1.0 + w) / 2.0, 1.0))
+                            } else {
+                                let h = ta / ca;
+                                Rect::from_min_max(Pos2::new(0.0, (1.0 - h) / 2.0), Pos2::new(1.0, (1.0 + h) / 2.0))
+                            };
+                            egui::Image::new(t).corner_radius(14.0).uv(uv).paint_at(ui, rect);
+                        }
+                        let pr = ui.painter();
+                        let low = Rect::from_min_max(Pos2::new(rect.left(), rect.top() + rect.height() * 0.62), rect.right_bottom());
+                        pr.rect_filled(low, egui::CornerRadius { nw: 0, ne: 0, sw: 14, se: 14 }, Color32::from_black_alpha(if thumb.is_some() { 150 } else { 95 }));
+                        if thumb.is_none() {
+                            pr.text(Pos2::new(rect.center().x, rect.top() + rect.height() * 0.34), Align2::CENTER_CENTER, (i + 1).to_string(), FontId::proportional(32.0), Color32::from_white_alpha(120));
+                        }
                         pr.with_clip_rect(low.shrink2(Vec2::new(10.0, 0.0))).text(low.left_center() + Vec2::new(10.0, 0.0), Align2::LEFT_CENTER, name, FontId::proportional(12.0), Color32::WHITE);
                         if now {
                             pr.rect_stroke(rect, 14.0, Stroke::new(3.0, p.accent), StrokeKind::Outside);
@@ -1037,6 +1120,7 @@ impl App {
                     }
                 });
             });
+            self.thumb_want = wanted;
             if let Some(i) = jump { v.set_i64("playlist-pos", i as i64); }
         });
 
