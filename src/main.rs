@@ -1,10 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(deprecated)]
 mod opensub;
+mod skins;
+mod update;
 mod video;
 
+use skins::Skin;
 use eframe::egui::{self, Color32, Key, Modifiers, RichText, Sense, Stroke, Vec2};
-use std::{sync::{Arc, mpsc}, time::{Duration, Instant}};
+use std::{sync::{Arc, atomic::{AtomicU64, Ordering}, mpsc}, time::{Duration, Instant}};
 use video::{Video, data_dir, migrate_legacy_data};
 
 // Graphite Blue tokens (from the approved mockup).
@@ -114,7 +117,11 @@ struct App {
     url_focus: bool,
     url: String,
     seeking: bool,
-    dock_shown: Option<bool>,
+    skin: Skin,
+    skin_applied: Option<Skin>,
+    /// Where subtitles sit (mpv `sub-pos`, 100 = bottom) before the user's own lift; set by each layout.
+    sub_base: f64,
+    sub_pos_applied: f64,
     last_trim: Instant,
     trim_at: Option<Instant>,
     was_loaded: bool,
@@ -149,6 +156,16 @@ struct App {
     os_rx: Option<mpsc::Receiver<opensub::Msg>>,
     os_hits: Vec<opensub::Hit>,
     os_status: String,
+    // Updates from GitHub Releases.
+    upd_auto: bool,
+    upd_skip: String,
+    upd_open: bool,
+    upd_manual: bool,
+    upd_installing: bool,
+    upd_status: String,
+    upd_rel: Option<update::Release>,
+    upd_rx: Option<mpsc::Receiver<update::Msg>>,
+    upd_progress: Arc<AtomicU64>,
 }
 
 
@@ -246,6 +263,10 @@ fn fonts(ctx: &egui::Context) {
 
 fn style(ctx: &egui::Context) {
     fonts(ctx);
+    ctx.set_visuals(graphite_visuals());
+}
+
+fn graphite_visuals() -> egui::Visuals {
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;
     v.window_fill = SURFACE;
@@ -266,7 +287,7 @@ fn style(ctx: &egui::Context) {
     v.widgets.hovered.weak_bg_fill = RAISED;
     v.widgets.active.bg_fill = ACCENT;
     v.widgets.active.weak_bg_fill = RAISED;
-    ctx.set_visuals(v);
+    v
 }
 
 impl App {
@@ -288,7 +309,10 @@ impl App {
             url_focus: false,
             url: String::new(),
             seeking: false,
-            dock_shown: None,
+            skin: Skin::Graphite,
+            skin_applied: None,
+            sub_base: 100.0,
+            sub_pos_applied: f64::NAN,
             last_trim: Instant::now() - Duration::from_secs(17), // first trim ~3 s after start
             trim_at: None,
             was_loaded: false,
@@ -321,9 +345,22 @@ impl App {
             os_rx: None,
             os_hits: Vec::new(),
             os_status: String::new(),
+            upd_auto: true,
+            upd_skip: String::new(),
+            upd_open: false,
+            upd_manual: false,
+            upd_installing: false,
+            upd_status: String::new(),
+            upd_rel: None,
+            upd_rx: None,
+            upd_progress: Arc::new(AtomicU64::new(0)),
         };
+        update::cleanup(); // remove the exe an earlier update left behind
         app.load_settings();
         app.load_os_creds();
+        if app.upd_auto {
+            app.check_update(false);
+        }
         let args: Vec<String> = std::env::args().skip(1).collect();
         app.open(&args, true);
         app
@@ -431,10 +468,10 @@ impl App {
         let fx: Vec<String> = self.fx.iter().map(|g| g.to_string()).collect();
         let text = format!(
             "eq={}\neq_on={}\nnorm={}\ncomp={}\nfx={}\nsharpen={}\ndenoise={}\n\
-             sub_scale={}\nsub_color={}\nsub_border={}\nsub_bold={}\nsub_lift={}\nsub_ass={}\nsub_auto={}\nslang={}\nalang={}\nos_lang={}\n",
+             sub_scale={}\nsub_color={}\nsub_border={}\nsub_bold={}\nsub_lift={}\nsub_ass={}\nsub_auto={}\nslang={}\nalang={}\nos_lang={}\nupd_auto={}\nupd_skip={}\nskin={}\n",
             list(&eq), self.eq_on as u8, self.norm as u8, self.comp as u8, list(&fx), self.sharpen as u8, self.denoise as u8,
             self.sub_scale, self.sub_color, self.sub_border, self.sub_bold as u8, self.sub_lift, self.sub_ass as u8, self.sub_auto,
-            one_line(&self.slang), one_line(&self.alang), one_line(&self.os_lang)
+            one_line(&self.slang), one_line(&self.alang), one_line(&self.os_lang), self.upd_auto as u8, one_line(&self.upd_skip), self.skin.key()
         );
         let path = Self::settings_path();
         if let Some(dir) = path.parent() {
@@ -466,6 +503,9 @@ impl App {
                 "slang" => self.slang = v.to_string(),
                 "alang" => self.alang = v.to_string(),
                 "os_lang" => self.os_lang = v.to_string(),
+                "upd_auto" => self.upd_auto = v == "1",
+                "upd_skip" => self.upd_skip = v.to_string(),
+                "skin" => if let Some(s) = Skin::from_key(v) { self.skin = s },
                 _ => {}
             }
         }
@@ -493,7 +533,89 @@ impl App {
         v.set_str("sub-file-paths", "sub;subs;Subs;Subtitles");
         v.set_str("slang", self.slang.trim());
         v.set_str("alang", self.alang.trim());
-        self.dock_shown = None; // re-applies sub-pos with the new lift
+        self.sub_pos_applied = f64::NAN; // re-applies sub-pos with the new lift
+    }
+
+    /// Ask GitHub for the latest release in the background. A manual check reports every outcome;
+    /// the automatic one stays silent unless a newer version exists.
+    fn check_update(&mut self, manual: bool) {
+        if self.upd_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.upd_rx = Some(rx);
+        self.upd_manual = manual;
+        if manual {
+            self.upd_open = true;
+            self.upd_rel = None;
+            self.upd_status = "Checking for updates…".into();
+        }
+        std::thread::spawn(move || {
+            let _ = tx.send(match update::check(update::REPO, VERSION) {
+                Ok(r) => update::Msg::Checked(r),
+                Err(e) => update::Msg::Error(e),
+            });
+        });
+    }
+
+    fn install_update(&mut self) {
+        let (Some(rel), None) = (self.upd_rel.clone(), &self.upd_rx) else { return };
+        let Ok(exe) = std::env::current_exe() else { return };
+        let (tx, rx) = mpsc::channel();
+        self.upd_rx = Some(rx);
+        self.upd_installing = true;
+        self.upd_status = "Downloading…".into();
+        self.upd_progress.store(0, Ordering::Relaxed);
+        let progress = self.upd_progress.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(match update::install(&rel, &exe, &progress) {
+                Ok(()) => update::Msg::Installed,
+                Err(e) => update::Msg::Error(e),
+            });
+        });
+    }
+
+    fn upd_poll(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.upd_rx else { return };
+        let msg = match rx.try_recv() {
+            Ok(m) => m,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => update::Msg::Error("Update worker stopped unexpectedly".into()),
+        };
+        self.upd_rx = None;
+        let was_installing = std::mem::take(&mut self.upd_installing);
+        match msg {
+            update::Msg::Checked(Some(rel)) => {
+                if self.upd_manual || rel.version != self.upd_skip {
+                    self.upd_status.clear();
+                    self.upd_rel = Some(rel);
+                    self.upd_open = true;
+                } else {
+                    self.upd_open = false;
+                }
+            }
+            update::Msg::Checked(None) => {
+                if self.upd_manual {
+                    self.upd_status = format!("You have the latest version ({VERSION}).");
+                }
+            }
+            update::Msg::Installed => {
+                self.save_settings();
+                if let Some(v) = &self.video {
+                    v.cmd("write-watch-later-config", &[]);
+                }
+                match update::restart() {
+                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(e) => self.upd_status = format!("Updated, but could not restart: {e}. Start Layar again."),
+                }
+            }
+            update::Msg::Error(e) => {
+                if self.upd_manual || was_installing {
+                    self.upd_status = format!("Update failed: {e}");
+                    self.upd_open = true;
+                }
+            }
+        }
     }
 
     fn os_path() -> std::path::PathBuf {
@@ -690,8 +812,13 @@ impl App {
     }
 
     fn menu(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        egui::MenuBar::new().ui(ui, |ui| self.menu_items(ctx, ui));
+    }
+
+    /// The top-level menus. Graphite shows them in a menu bar; the other skins put them in a popup.
+    pub(crate) fn menu_items(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let Some(v) = self.video.clone() else { return };
-        egui::MenuBar::new().ui(ui, |ui| {
+        {
             ui.menu_button("Media", |ui| {
                 if ui.button("Open files…   Ctrl+O").clicked() { self.pick_files(true); ui.close(); }
                 if ui.button("Add to playlist…").clicked() { self.pick_files(false); ui.close(); }
@@ -778,12 +905,21 @@ impl App {
             });
             ui.menu_button("View", |ui| {
                 if ui.checkbox(&mut self.show_playlist, "Playlist   P").clicked() { ui.close(); }
+                ui.menu_button("Skin", |ui| {
+                    for sk in Skin::ALL {
+                        if ui.selectable_label(self.skin == sk, sk.name()).clicked() { self.skin = sk; self.save_settings(); ui.close(); }
+                    }
+                });
             });
             ui.menu_button("Help", |ui| {
                 if ui.button("Keyboard shortcuts   F1").clicked() { self.help_open = true; ui.close(); }
+                ui.separator();
+                if ui.button("Check for updates…").clicked() { self.check_update(true); ui.close(); }
+                if ui.checkbox(&mut self.upd_auto, "Check for updates at startup").changed() { self.save_settings(); }
+                ui.separator();
                 if ui.button(format!("About {APP_NAME}")).clicked() { self.about_open = true; ui.close(); }
             });
-        });
+        }
     }
 
     /// Thin horizontal bar: click or drag to pick a position. Returns the new fraction 0..=1.
@@ -990,56 +1126,9 @@ impl App {
     }
 }
 
-impl eframe::App for App {
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // The mpv core is never destroyed, so its own save-on-quit never runs.
-        self.save_settings();
-        if let Some(v) = &self.video {
-            v.cmd("write-watch-later-config", &[]);
-        }
-    }
-
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(100));
-        if self.af_dirty.is_some_and(|t| t.elapsed() > Duration::from_millis(250)) {
-            self.af_dirty = None;
-            self.apply_af();
-        }
-        self.refresh();
-        self.os_poll();
-        self.shortcuts(ctx);
-
-        // Trim once things settle after a file opens, and every 20 s otherwise.
-        if self.s.loaded && !self.was_loaded {
-            self.trim_at = Some(Instant::now() + Duration::from_secs(3));
-        }
-        self.was_loaded = self.s.loaded;
-        if self.trim_at.is_some_and(|t| Instant::now() >= t) || self.last_trim.elapsed() > Duration::from_secs(20) {
-            trim_memory();
-            self.last_trim = Instant::now();
-            self.trim_at = None;
-        }
-
-        let dropped: Vec<String> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_string_lossy().into_owned()).collect());
-        if !dropped.is_empty() {
-            self.open(&dropped, true);
-        }
-        if ctx.input(|i| i.pointer.delta() != Vec2::ZERO || i.pointer.any_down()) {
-            self.last_move = Instant::now();
-        }
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = &ui.ctx().clone();
-        if let Some(e) = &self.err {
-            egui::CentralPanel::default().show(ui, |ui| {
-                ui.heading("Cannot start mpv");
-                ui.label(e);
-                ui.label("Make sure libmpv-2.dll sits next to the executable.");
-            });
-            return;
-        }
-
+impl App {
+    /// The original layout: menu bar on top, status bar, side panel, floating dock.
+    fn layout_graphite(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if !self.fullscreen {
             egui::Panel::top("menu").frame(egui::Frame::new().fill(SURFACE).stroke(Stroke::new(1.0, LINE)).inner_margin(egui::Margin::symmetric(8, 4))).show(ui, |ui| self.menu(ctx, ui));
             self.status_bar(ui);
@@ -1076,12 +1165,77 @@ impl eframe::App for App {
         if dock_visible {
             self.dock(ctx, video_rect);
         }
-        // Lift subtitles above the floating dock; back to the bottom when it is hidden.
-        if self.dock_shown != Some(dock_visible) {
-            self.dock_shown = Some(dock_visible);
+        // The dock floats over the picture: lift subtitles above it.
+        self.sub_base = if dock_visible { 84.0 } else { 100.0 };
+    }
+}
+
+impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // The mpv core is never destroyed, so its own save-on-quit never runs.
+        self.save_settings();
+        if let Some(v) = &self.video {
+            v.cmd("write-watch-later-config", &[]);
+        }
+    }
+
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.request_repaint_after(Duration::from_millis(100));
+        if self.af_dirty.is_some_and(|t| t.elapsed() > Duration::from_millis(250)) {
+            self.af_dirty = None;
+            self.apply_af();
+        }
+        self.refresh();
+        self.os_poll();
+        self.upd_poll(ctx);
+        self.shortcuts(ctx);
+
+        // Trim once things settle after a file opens, and every 20 s otherwise.
+        if self.s.loaded && !self.was_loaded {
+            self.trim_at = Some(Instant::now() + Duration::from_secs(3));
+        }
+        self.was_loaded = self.s.loaded;
+        if self.trim_at.is_some_and(|t| Instant::now() >= t) || self.last_trim.elapsed() > Duration::from_secs(20) {
+            trim_memory();
+            self.last_trim = Instant::now();
+            self.trim_at = None;
+        }
+
+        let dropped: Vec<String> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_string_lossy().into_owned()).collect());
+        if !dropped.is_empty() {
+            self.open(&dropped, true);
+        }
+        if ctx.input(|i| i.pointer.delta() != Vec2::ZERO || i.pointer.any_down()) {
+            self.last_move = Instant::now();
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &ui.ctx().clone();
+        if let Some(e) = &self.err {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.heading("Cannot start mpv");
+                ui.label(e);
+                ui.label("Make sure libmpv-2.dll sits next to the executable.");
+            });
+            return;
+        }
+
+        self.apply_skin(ctx);
+        // Fullscreen always uses the clean Cinema overlay, whatever the skin.
+        let skin = if self.fullscreen && self.skin != Skin::Graphite { Skin::Cinema } else { self.skin };
+        if skin == Skin::Graphite {
+            self.layout_graphite(ui, ctx);
+        } else {
+            self.layout_skin(skin, ui, ctx);
+        }
+        // Keep subtitles clear of whatever the layout draws over the bottom of the picture.
+        let want = self.sub_base - self.sub_lift as f64;
+        if self.sub_pos_applied.is_nan() || (want - self.sub_pos_applied).abs() > 0.05 {
             if let Some(v) = &self.video {
-                v.set_f64("sub-pos", (if dock_visible { 84.0 } else { 100.0 }) - self.sub_lift as f64);
+                v.set_f64("sub-pos", want);
             }
+            self.sub_pos_applied = want;
         }
 
         if self.eq_open {
@@ -1284,6 +1438,59 @@ impl eframe::App for App {
                 self.save_settings();
             }
             self.os_open = open;
+        }
+
+        if self.upd_open {
+            let mut open = true;
+            let (mut install, mut skip) = (false, false);
+            let (installing, checking) = (self.upd_installing, self.upd_rx.is_some() && !self.upd_installing);
+            egui::Window::new("Software update").pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.set_width(420.0);
+                if let Some(rel) = &self.upd_rel {
+                    ui.label(RichText::new(format!("{APP_NAME} {} is available", rel.version)).size(16.0).strong());
+                    ui.label(RichText::new(format!("You have {VERSION}.")).color(MUTED));
+                    if !rel.notes.trim().is_empty() {
+                        ui.add_space(6.0);
+                        egui::ScrollArea::vertical().max_height(170.0).show(ui, |ui| {
+                            ui.label(RichText::new(rel.notes.trim()).size(12.5));
+                        });
+                    }
+                    ui.add_space(8.0);
+                    if installing {
+                        let total = rel.asset_size.max(1) as f32;
+                        let done = self.upd_progress.load(Ordering::Relaxed) as f32;
+                        ui.add(egui::ProgressBar::new((done / total).min(1.0)).text(format!("{:.0} / {:.0} MB", done / 1_048_576.0, total / 1_048_576.0)));
+                        ui.label(RichText::new("Layar restarts by itself when it is done.").size(12.0).color(MUTED));
+                    } else {
+                        ui.horizontal(|ui| {
+                            if ui.button("Update and restart").clicked() { install = true; }
+                            if ui.button("Later").clicked() { self.upd_open = false; }
+                            if ui.button("Skip this version").clicked() { skip = true; }
+                            ui.hyperlink_to("Release page", &rel.page);
+                        });
+                    }
+                }
+                if !self.upd_status.is_empty() && !installing {
+                    ui.add_space(4.0);
+                    ui.label(&self.upd_status);
+                }
+                if checking {
+                    ui.spinner();
+                }
+            });
+            if install {
+                self.install_update();
+            }
+            if skip {
+                if let Some(r) = &self.upd_rel {
+                    self.upd_skip = r.version.clone();
+                }
+                self.save_settings();
+                self.upd_open = false;
+            }
+            if !open && !self.upd_installing {
+                self.upd_open = false;
+            }
         }
 
         if self.help_open {
