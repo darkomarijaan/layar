@@ -1,6 +1,6 @@
 [package]
 name = "layar"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "A video player: egui interface, libmpv playback"
 license = "MIT"

@@ -4,7 +4,9 @@ A fast, small video player for Windows, written in Rust. [egui](https://github.c
 
 ## Download
 
-Grab the portable zip from the [Releases](https://github.com/darkomarijaan/layar/releases) page, unzip it anywhere and run `Layar.exe`. No installer. Keep `libmpv-2.dll` next to the exe.
+Grab the portable package from the [Releases](https://github.com/darkomarijaan/layar/releases) page, unpack it anywhere and run `Layar.exe`. No installer. Keep `libmpv-2.dll` next to the exe.
+
+Two formats of the same package: `.zip` (about 50 MB, opens everywhere) and `.7z` (about 33 MB, needs 7-Zip or a recent Windows 11). Most of the size is `libmpv-2.dll`, the player core; Layar itself is about 4 MB.
 
 Requires Windows 10 or 11 (64-bit) and a GPU with OpenGL 3.3 or newer.
 
@@ -74,9 +76,17 @@ Lounge cards show a real frame from each video (taken at 12 % of the file, made 
 
 At startup Layar asks GitHub whether a newer release exists (one small request, nothing about you or your files is sent). If there is, a dialog shows the release notes and offers **Update and restart**, **Later** or **Skip this version**. You can also use **Help > Check for updates...**, and turn the startup check off in the same menu.
 
-An update downloads the release zip, checks it against the SHA-256 that GitHub publishes for that file, and replaces only `Layar.exe` (the previous one is kept as `Layar.exe.old` until the next start). If the checksum does not match, nothing is changed. `libmpv-2.dll` is not replaced: when a release says the player core changed, download the zip manually. If Layar sits in a folder it cannot write to (for example Program Files), the update reports an error and you can download the zip yourself.
+An update downloads a small zip that holds only `Layar.exe` (about 4 MB; the full package is about 50 MB because of `libmpv-2.dll`), checks it against the SHA-256 that GitHub publishes for that file, and replaces `Layar.exe` (the previous one is kept as `Layar.exe.old` until the next start). If the checksum does not match, nothing is changed. `libmpv-2.dll` is not replaced: when a release says the player core changed, download the full package manually. If Layar sits in a folder it cannot write to (for example Program Files), the update reports an error and you can download the package yourself.
 
-To make a release that auto-update can use, publish a GitHub release tagged `vX.Y.Z` with an asset whose name ends in `win64-portable.zip` and which contains `Layar.exe`, and raise `version` in `Cargo.toml` to match.
+To make a release that auto-update can use, publish a GitHub release tagged `vX.Y.Z` and raise `version` in `Cargo.toml` to match. Attach:
+
+| Asset name ends in | Contains | Used by |
+|---|---|---|
+| `win64-exe.zip` | `Layar.exe` only (about 4 MB) | auto-update, preferred |
+| `win64-portable.zip` | the full portable folder (about 50 MB) | auto-update from 0.3.1 and earlier, and manual download |
+| `win64-portable.7z` | the same folder, 7-Zip/LZMA (about 33 MB) | manual download, needs 7-Zip or a recent Windows 11 |
+
+If a release has no `win64-exe.zip` (or it has no published checksum), the updater falls back to the full zip.
 
 ## Data folder
 

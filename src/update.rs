@@ -1,8 +1,8 @@
 //! Self-update from GitHub Releases (blocking; call from a worker thread).
 //!
-//! Flow: ask the API for the latest release, compare versions, download the portable zip,
-//! check its SHA-256 against the digest GitHub publishes for the asset, pull `Layar.exe` out,
-//! and swap it in. Windows lets a running exe be renamed but not overwritten, so the old one
+//! Flow: ask the API for the latest release, compare versions, download the small exe zip (or the
+//! full portable zip when a release has none), check its SHA-256 against the digest GitHub publishes
+//! for the asset, pull `Layar.exe` out, and swap it in. Windows lets a running exe be renamed but not overwritten, so the old one
 //! becomes `Layar.exe.old` (deleted on the next start).
 
 use sha2::{Digest, Sha256};
@@ -51,13 +51,14 @@ fn agent() -> ureq::Agent {
     ureq::Agent::config_builder().timeout_connect(Some(Duration::from_secs(15))).timeout_recv_body(Some(Duration::from_secs(300))).build().into()
 }
 
+/// Choose what to download. The small `*win64-exe.zip` (just Layar.exe, a few MB) wins when it has a
+/// published checksum; otherwise the full `*win64-portable.zip` (which also carries libmpv-2.dll, ~50 MB).
 fn pick(v: &serde_json::Value) -> Result<Release, String> {
-    let asset = v["assets"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|a| a["name"].as_str().is_some_and(|n| n.ends_with("win64-portable.zip")))
-        .ok_or("The latest release has no Windows zip")?;
+    let assets: Vec<&serde_json::Value> = v["assets"].as_array().into_iter().flatten().collect();
+    let by_suffix = |suffix: &str, need_digest: bool| {
+        assets.iter().copied().find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(suffix)) && (!need_digest || a["digest"].is_string()))
+    };
+    let asset = by_suffix("win64-exe.zip", true).or_else(|| by_suffix("win64-portable.zip", false)).ok_or("The latest release has no Windows zip")?;
     // Only download from GitHub itself.
     let asset_url = asset["browser_download_url"].as_str().filter(|u| u.starts_with("https://github.com/")).ok_or("Bad download link")?;
     Ok(Release {
@@ -191,6 +192,49 @@ mod tests {
         assert!(!is_newer("garbage", "0.2.0"));
     }
 
+    fn release_json(assets: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "tag_name": "v1.2.3", "body": "notes", "html_url": "https://github.com/x/y/releases/tag/v1.2.3", "assets": assets })
+    }
+
+    fn asset(name: &str, size: u64, digest: Option<&str>) -> serde_json::Value {
+        let mut a = serde_json::json!({ "name": name, "size": size, "browser_download_url": format!("https://github.com/x/y/releases/download/v1.2.3/{name}") });
+        if let Some(d) = digest {
+            a["digest"] = serde_json::json!(format!("sha256:{d}"));
+        }
+        a
+    }
+
+    #[test]
+    fn pick_prefers_the_small_exe_zip() {
+        let r = pick(&release_json(serde_json::json!([
+            asset("Layar-1.2.3-win64-portable.zip", 50_000_000, Some("AA")),
+            asset("Layar-1.2.3-win64-portable.7z", 33_000_000, Some("BB")),
+            asset("Layar-1.2.3-win64-exe.zip", 4_000_000, Some("CC")),
+        ])))
+        .unwrap();
+        assert_eq!(r.version, "1.2.3");
+        assert!(r.asset_url.ends_with("win64-exe.zip"));
+        assert_eq!((r.asset_size, r.sha256.as_deref()), (4_000_000, Some("cc")));
+    }
+
+    #[test]
+    fn pick_falls_back_to_the_full_zip() {
+        // No exe zip at all (releases up to 0.3.1): use the portable zip.
+        let r = pick(&release_json(serde_json::json!([asset("Layar-0.3.1-win64-portable.zip", 50_000_000, Some("AA"))]))).unwrap();
+        assert!(r.asset_url.ends_with("win64-portable.zip"));
+        // An exe zip without a checksum cannot be verified, so it is skipped too.
+        let r = pick(&release_json(serde_json::json!([asset("L-win64-exe.zip", 4_000_000, None), asset("L-win64-portable.zip", 50_000_000, Some("AA"))]))).unwrap();
+        assert!(r.asset_url.ends_with("win64-portable.zip"));
+    }
+
+    #[test]
+    fn pick_ignores_the_7z_and_foreign_hosts() {
+        assert!(pick(&release_json(serde_json::json!([asset("L-win64-portable.7z", 1, Some("AA"))]))).is_err());
+        let mut a = asset("L-win64-exe.zip", 1, Some("AA"));
+        a["browser_download_url"] = serde_json::json!("https://evil.example/L-win64-exe.zip");
+        assert!(pick(&release_json(serde_json::json!([a]))).is_err());
+    }
+
     #[test]
     fn swap_replaces_and_keeps_old() {
         let dir = std::env::temp_dir().join(format!("layar-swap-{}", std::process::id()));
@@ -209,6 +253,8 @@ mod tests {
     fn live_install_from_github() {
         let rel = check(REPO, "0.0.1").unwrap().expect("a release newer than 0.0.1");
         assert!(rel.sha256.is_some(), "release asset has no digest");
+        // Releases from 0.3.2 on ship the small exe zip, and that is what updates should download.
+        assert!(rel.asset_url.ends_with("win64-exe.zip") && rel.asset_size < 10_000_000, "picked {} ({} bytes)", rel.asset_url, rel.asset_size);
         let dir = std::env::temp_dir().join(format!("layar-live-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("Layar.exe");
